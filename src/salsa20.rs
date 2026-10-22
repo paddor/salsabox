@@ -145,13 +145,12 @@ where
 {
     let lanes = S::u32s::LEN;
     let mut counter = get_counter(state);
-    let mut scratch = BatchScratch([0; MAX_BATCH_LEN / 8]);
-    let keystream = scratch.bytes();
+    let mut scratch = BatchScratch([0; MAX_BATCH_LEN / 4]);
 
     let mut batches = data.chunks_exact_mut(lanes * BLOCK_LEN);
     for chunk in &mut batches {
         let words = batch_rounds::<S, S::u32s>(simd, state, counter);
-        xor_keystream_column(&words, lanes, keystream, chunk);
+        xor_keystream_column(&words, lanes, &mut scratch, chunk);
         counter = counter.wrapping_add(lanes as u64);
     }
 
@@ -164,7 +163,7 @@ where
             break;
         }
         let words = batch_rounds::<S, u32x4<S>>(simd, state, counter);
-        xor_keystream_column(&words, TAIL_LANES, keystream, chunk);
+        xor_keystream_column(&words, TAIL_LANES, &mut scratch, chunk);
         counter = counter.wrapping_add(TAIL_LANES as u64);
     }
 }
@@ -200,17 +199,9 @@ fn xor_block(state: &[u32; STATE_WORDS], data: &mut [u8]) {
     block.zeroize();
 }
 
-/// Keystream of one SIMD batch in block order. Word storage keeps the
-/// wipe on drop at one volatile write per 8 bytes.
-struct BatchScratch([u64; MAX_BATCH_LEN / 8]);
-
-impl BatchScratch {
-    fn bytes(&mut self) -> &mut [u8; MAX_BATCH_LEN] {
-        // SAFETY: the word array has the size of the byte array, `u8` has
-        // alignment 1, and every bit pattern is a valid `u8` and `u64`.
-        unsafe { &mut *self.0.as_mut_ptr().cast::<[u8; MAX_BATCH_LEN]>() }
-    }
-}
+/// Keystream words of one SIMD batch in block order. Word storage keeps
+/// the wipe on drop at one volatile write per 4 bytes.
+struct BatchScratch([u32; MAX_BATCH_LEN / 4]);
 
 impl Drop for BatchScratch {
     fn drop(&mut self) {
@@ -219,23 +210,30 @@ impl Drop for BatchScratch {
 }
 
 /// Store the column-layout keystream of `lanes` blocks in block order,
-/// then XOR it into `chunk`. The separate XOR pass vectorizes.
+/// then XOR it into `chunk` 4 bytes at a time. The separate XOR pass
+/// vectorizes.
 #[inline(always)]
 fn xor_keystream_column<V>(
     words: &[V; STATE_WORDS],
     lanes: usize,
-    keystream: &mut [u8],
+    scratch: &mut BatchScratch,
     chunk: &mut [u8],
 ) where
     V: SimdOps + core::ops::Index<usize, Output = u32>,
 {
     for (index, word) in words.iter().enumerate() {
         for lane in 0..lanes {
-            let offset = lane * BLOCK_LEN + index * 4;
-            keystream[offset..offset + 4].copy_from_slice(&word[lane].to_le_bytes());
+            scratch.0[lane * STATE_WORDS + index] = word[lane];
         }
     }
-    xor_bytes(chunk, keystream);
+
+    let (whole, tail) = chunk.as_chunks_mut::<4>();
+    for (bytes, key) in whole.iter_mut().zip(&scratch.0) {
+        *bytes = (u32::from_le_bytes(*bytes) ^ key).to_le_bytes();
+    }
+    if !tail.is_empty() {
+        xor_bytes(tail, &scratch.0[whole.len()].to_le_bytes());
+    }
 }
 
 pub(crate) trait SimdOps:
@@ -339,8 +337,14 @@ fn set_counter(state: &mut [u32; STATE_WORDS], counter: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::{FIRSTKEY, NONCE, Rng, hex};
+    use sha2::{Digest, Sha256};
     use std::vec;
     use std::vec::Vec;
+
+    /// libsodium `test/default/stream.exp`: `XSalsa20` keystreams under the
+    /// `NaCl` `firstkey` and nonce.
+    const SODIUM_STREAM_EXP: &str = include_str!("../testdata/libsodium-stream.exp");
 
     /// XOR with one scalar block per 64 bytes, the reference for SIMD paths.
     fn xor_scalar(key: &[u8; 32], nonce: &[u8; 24], data: &mut [u8]) -> [u8; 32] {
@@ -358,7 +362,9 @@ mod tests {
         poly_key
     }
 
-    /// Every level this CPU supports, from the fallback up.
+    /// Every level this CPU supports, from the fallback up. Levels named in
+    /// `SALSABOX_REQUIRE_LEVEL` (comma separated) must be among them, so a
+    /// CI job cannot silently skip the level it exists for.
     fn levels() -> Vec<(&'static str, Level)> {
         let detected = Level::new();
         let mut out = vec![
@@ -381,6 +387,39 @@ mod tests {
         if let Some(level) = detected.as_neon() {
             out.push(("neon", Level::Neon(level)));
         }
+        if let Ok(required) = std::env::var("SALSABOX_REQUIRE_LEVEL") {
+            for name in required
+                .split(',')
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+            {
+                assert!(
+                    out.iter().any(|(level, _)| *level == name),
+                    "required level {name} is not available"
+                );
+            }
+        }
+        out
+    }
+
+    /// Raw `XSalsa20` keystream under the `NaCl` key: block 0, then blocks 1
+    /// and up.
+    fn raw_keystream(level: Level, len: usize) -> Vec<u8> {
+        let keystream = Keystream::new(&FIRSTKEY, &NONCE);
+        let mut out = vec![0u8; len];
+        let head = len.min(FIRST_BLOCK_DATA_OFFSET);
+        out[..head].copy_from_slice(&keystream.poly1305_key()[..head]);
+        keystream.xor_at_level(&mut out[head..], level);
+        out
+    }
+
+    /// Keystream under the `NaCl` key from block `counter` on, through the
+    /// batch path.
+    fn keystream_from(level: Level, counter: u64, len: usize) -> Vec<u8> {
+        let mut state = Keystream::new(&FIRSTKEY, &NONCE).state;
+        set_counter(&mut state, counter);
+        let mut out = vec![0u8; len];
+        dispatch!(level, simd => xor_stream(simd, &state, &mut out));
         out
     }
 
@@ -421,6 +460,57 @@ mod tests {
                 assert_eq!(chunk, salsa20_block(&state), "{name} block {index}");
                 let next = get_counter(&state) + 1;
                 set_counter(&mut state, next);
+            }
+        }
+    }
+    #[test]
+    fn random_inputs_match_scalar() {
+        let levels = levels();
+        let mut rng = Rng::new(0x5a15_ab0c);
+        for _ in 0..200 {
+            let mut key = [0u8; 32];
+            let mut nonce = [0u8; 24];
+            rng.fill(&mut key);
+            rng.fill(&mut nonce);
+            let mut plaintext = vec![0u8; rng.below(3 * MAX_BATCH_LEN)];
+            rng.fill(&mut plaintext);
+            let mut expected = plaintext.clone();
+            xor_scalar(&key, &nonce, &mut expected);
+
+            for (name, level) in &levels {
+                let mut actual = plaintext.clone();
+                Keystream::new(&key, &nonce).xor_at_level(&mut actual, *level);
+                assert_eq!(actual, expected, "{name} len {}", plaintext.len());
+            }
+        }
+    }
+
+    #[test]
+    fn libsodium_stream_vectors() {
+        let lines: Vec<&str> = SODIUM_STREAM_EXP.lines().collect();
+        assert_eq!(lines.len(), 83);
+        for (name, level) in levels() {
+            let mut stream = raw_keystream(level, 4_194_304);
+            assert_eq!(hex(&Sha256::digest(&stream)), lines[0], "{name} 4 MiB");
+
+            stream[..4000].copy_from_slice(&keystream_from(level, 1, 4000));
+            assert_eq!(
+                hex(&Sha256::digest(&stream)),
+                lines[1],
+                "{name} from block 1"
+            );
+
+            for (len, line) in lines[2..66].iter().enumerate() {
+                let mut out = vec![len as u8; BLOCK_LEN];
+                out[..len].copy_from_slice(&raw_keystream(level, len));
+                assert_eq!(hex(&out), *line, "{name} prefix {len}");
+            }
+
+            let carry = keystream_from(level, (1 << 32) - 1, 192);
+            assert_eq!(hex(&carry), lines[66], "{name} carry");
+            for (back, line) in (1..=16u64).rev().zip(&lines[67..]) {
+                let out = keystream_from(level, (1 << 32) - back, 17 * BLOCK_LEN);
+                assert_eq!(hex(&out), *line, "{name} carry from 2^32 - {back}");
             }
         }
     }

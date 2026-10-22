@@ -2,14 +2,15 @@
 name = "salsabox"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.93"
+rust-version = "1.89"
 license = "MIT OR Apache-2.0"
 authors = ["Patrik Wenger <paddor@gmail.com>"]
-description = "NaCl-compatible XSalsa20-Poly1305 secret boxes with a portable SIMD Salsa20 backend."
-repository = "https://github.com/paddor/omq.rs"
+description = "NaCl-compatible XSalsa20-Poly1305 boxes with a portable SIMD Salsa20 core."
+repository = "https://github.com/paddor/salsabox"
 keywords = ["salsa20", "xsalsa20", "poly1305", "nacl", "simd"]
 categories = ["cryptography", "no-std"]
 readme = "README.md"
+include = ["/src", "/testdata", "/README.md", "/CHANGELOG.md", "/LICENSE-*"]
 
 [features]
 default = ["std"]
@@ -17,7 +18,7 @@ std = ["fearless_simd/std"]
 
 [dependencies]
 fearless_simd = { version = "1.1", default-features = false, features = ["libm"] }
-poly1305 = { version = "0.8", default-features = false }
+poly1305 = { version = "0.9.1", default-features = false }
 subtle = { version = "2.6", default-features = false }
 zeroize = { version = "1.8", default-features = false }
 
@@ -25,12 +26,15 @@ zeroize = { version = "1.8", default-features = false }
 fearless_simd = { version = "1.1", features = ["force_support_fallback"] }
 crypto_box = "0.9"
 crypto_secretbox = "0.1"
+sha2 = "0.10"
 x25519-dalek = { version = "3", features = ["static_secrets"] }
 
 [lints.rust]
 missing_debug_implementations = "deny"
-unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"
 rust_2018_idioms = { level = "warn", priority = -1 }
+unsafe_code = "forbid"
+unsafe_op_in_unsafe_fn = "deny"
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }
