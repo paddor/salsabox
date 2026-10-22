@@ -1,0 +1,12 @@
+[package]
+name = "salsabox-perf"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Quick salsabox vs libsodium check for CI."
+
+[workspace]
+
+[dependencies]
+fearless_simd = "1.1"
+salsabox = { path = ".." }

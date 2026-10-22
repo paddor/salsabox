@@ -27,6 +27,8 @@ jobs:
       - run: cargo clippy --all-targets --no-default-features
       - run: cargo doc --no-deps
       - run: cargo package
+      - run: cargo fmt --check --manifest-path perf/Cargo.toml
+      - run: cargo clippy --manifest-path perf/Cargo.toml
 
   test:
     strategy:
@@ -71,6 +73,28 @@ jobs:
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: ${{ env.SDE_PATH }}/sde64 -spr --
           SALSABOX_REQUIRE_LEVEL: sse4.2,avx2,avx512
+
+  # Real-hardware check against libsodium. The runner CPU decides the SIMD
+  # level; the job summary names it, and AVX-512 is measured when present.
+  perf:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: perf
+      - run: sudo apt-get update && sudo apt-get install -y libsodium-dev
+      - name: Generic build
+        run: cargo run --release --manifest-path perf/Cargo.toml
+        env:
+          PERF_LABEL: generic
+      - name: Native build
+        run: cargo run --release --manifest-path perf/Cargo.toml
+        env:
+          CARGO_TARGET_DIR: perf/target-native
+          PERF_LABEL: target-cpu=native
+          RUSTFLAGS: -D warnings -C target-cpu=native
 
   msrv:
     runs-on: ubuntu-latest
