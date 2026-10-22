@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.93"
 license = "MIT OR Apache-2.0"
 authors = ["Patrik Wenger <paddor@gmail.com>"]
-description = "NaCl-compatible XSalsa20-Poly1305 secret boxes with an AVX2 Salsa20 backend."
+description = "NaCl-compatible XSalsa20-Poly1305 secret boxes with a portable SIMD Salsa20 backend."
 repository = "https://github.com/paddor/omq.rs"
 keywords = ["salsa20", "xsalsa20", "poly1305", "nacl", "simd"]
 categories = ["cryptography", "no-std"]
@@ -13,14 +13,16 @@ readme = "README.md"
 
 [features]
 default = ["std"]
-std = []
+std = ["fearless_simd/std"]
 
 [dependencies]
+fearless_simd = { version = "1.1", default-features = false, features = ["libm"] }
 poly1305 = { version = "0.8", default-features = false }
 subtle = { version = "2.6", default-features = false }
 zeroize = { version = "1.8", default-features = false }
 
 [dev-dependencies]
+fearless_simd = { version = "1.1", features = ["force_support_fallback"] }
 crypto_box = "0.9"
 crypto_secretbox = "0.1"
 x25519-dalek = { version = "3", features = ["static_secrets"] }

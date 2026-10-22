@@ -45,11 +45,10 @@ impl SecretBox {
 
     /// Encrypt `buf` in place and return the detached Poly1305 tag.
     pub fn encrypt_detached(&self, nonce: &[u8; 24], buf: &mut [u8]) -> [u8; 16] {
-        let mut poly_key = [0u8; 32];
-        salsa20::xor_xsalsa20(self.key(), nonce, buf, &mut poly_key);
-        let tag = poly1305_tag(&poly_key, buf);
-        poly_key.zeroize();
-        tag
+        let keystream = salsa20::Keystream::new(self.key(), nonce);
+        let poly_key = Zeroizing::new(*keystream.poly1305_key());
+        keystream.xor(buf);
+        poly1305_tag(&poly_key, buf)
     }
 
     /// Verify `tag`, then decrypt `buf` in place.
@@ -59,20 +58,16 @@ impl SecretBox {
         buf: &mut [u8],
         tag: &[u8; 16],
     ) -> Result<(), Error> {
-        let mut poly_key = [0u8; 32];
-        salsa20::poly1305_key(self.key(), nonce, &mut poly_key);
-        let mut expected = poly1305_tag(&poly_key, buf);
+        let keystream = salsa20::Keystream::new(self.key(), nonce);
+        let mut expected = poly1305_tag(keystream.poly1305_key(), buf);
         let valid = expected.ct_eq(tag).unwrap_u8();
         expected.zeroize();
-        poly_key.zeroize();
 
         if valid == 0 {
             return Err(Error);
         }
 
-        let mut unused_poly_key = [0u8; 32];
-        salsa20::xor_xsalsa20(self.key(), nonce, buf, &mut unused_poly_key);
-        unused_poly_key.zeroize();
+        keystream.xor(buf);
         Ok(())
     }
 
@@ -267,30 +262,5 @@ mod tests {
 
         assert_eq!(box_.decrypt_detached(&nonce, &mut buf, &tag), Err(Error));
         assert_eq!(buf, before);
-    }
-
-    #[test]
-    #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
-    fn avx2_matches_scalar() {
-        if !std::arch::is_x86_feature_detected!("avx2") {
-            return;
-        }
-
-        let key = [0xC3u8; 32];
-        let nonce = [0x9Du8; 24];
-        for len in sizes() {
-            let mut scalar = bytes(len);
-            let mut avx2 = scalar.clone();
-            let mut scalar_poly = [0u8; 32];
-            let mut avx2_poly = [0u8; 32];
-
-            salsa20::xor_xsalsa20_scalar_for_test(&key, &nonce, &mut scalar, &mut scalar_poly);
-            unsafe {
-                salsa20::xor_xsalsa20_avx2_for_test(&key, &nonce, &mut avx2, &mut avx2_poly);
-            }
-
-            assert_eq!(scalar_poly, avx2_poly, "poly key len {len}");
-            assert_eq!(scalar, avx2, "ciphertext len {len}");
-        }
     }
 }
