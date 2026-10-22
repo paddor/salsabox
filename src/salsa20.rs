@@ -143,7 +143,13 @@ fn xor_stream<S: Simd>(simd: S, state: &[u32; STATE_WORDS], data: &mut [u8])
 where
     S::u32s: SimdOps,
 {
-    let lanes = S::u32s::LEN;
+    let lanes = const {
+        assert!(
+            S::u32s::LEN * BLOCK_LEN <= MAX_BATCH_LEN,
+            "SIMD batch exceeds the scratch buffer"
+        );
+        S::u32s::LEN
+    };
     let mut counter = get_counter(state);
     let mut scratch = BatchScratch([0; MAX_BATCH_LEN / 4]);
 
@@ -366,13 +372,11 @@ mod tests {
     /// `SALSABOX_REQUIRE_LEVEL` (comma separated) must be among them, so a
     /// CI job cannot silently skip the level it exists for.
     fn levels() -> Vec<(&'static str, Level)> {
-        let detected = Level::new();
-        let mut out = vec![
-            ("fallback", Level::fallback()),
-            ("baseline", Level::baseline()),
-        ];
+        let mut out = vec![("fallback", Level::fallback())];
+        out.push(("baseline", Level::baseline()));
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         {
+            let detected = Level::new();
             if let Some(level) = detected.as_sse4_2() {
                 out.push(("sse4.2", Level::Sse4_2(level)));
             }
@@ -384,7 +388,7 @@ mod tests {
             }
         }
         #[cfg(target_arch = "aarch64")]
-        if let Some(level) = detected.as_neon() {
+        if let Some(level) = Level::new().as_neon() {
             out.push(("neon", Level::Neon(level)));
         }
         if let Ok(required) = std::env::var("SALSABOX_REQUIRE_LEVEL") {

@@ -132,13 +132,16 @@ impl BoxKey {
     /// Derive a NaCl-compatible box key from the X25519 shared secret of
     /// our secret key and the peer's public key.
     ///
-    /// Reject an all-zero shared secret, which a low-order peer key
-    /// produces, before calling this. libsodium's `crypto_box_beforenm`
-    /// does that check; this function does not.
-    pub fn from_shared_secret(shared_secret: &[u8; 32]) -> Self {
-        Self {
-            inner: SecretBox::new(hsalsa20(shared_secret, &[0u8; 16])),
+    /// Returns `None` for an all-zero shared secret, which a low-order peer
+    /// key produces. libsodium's `crypto_box_beforenm` rejects it too. The
+    /// check runs in constant time.
+    pub fn from_shared_secret(shared_secret: &[u8; 32]) -> Option<Self> {
+        if bool::from(shared_secret.ct_eq(&[0u8; 32])) {
+            return None;
         }
+        Some(Self {
+            inner: SecretBox::new(hsalsa20(shared_secret, &[0u8; 16])),
+        })
     }
 
     /// Encrypt `buf` in place and return the detached Poly1305 tag.
@@ -237,7 +240,7 @@ mod tests {
         let shared = StaticSecret::from(ALICE_SECRET).diffie_hellman(&PublicKey::from(BOB_PUBLIC));
         assert_eq!(shared.as_bytes(), &SHARED);
 
-        let key = BoxKey::from_shared_secret(shared.as_bytes());
+        let key = BoxKey::from_shared_secret(shared.as_bytes()).unwrap();
         let mut buf = MESSAGE;
         let tag = key.encrypt_detached(&NONCE, &mut buf);
         assert_eq!(tag, BOXED[..16]);
@@ -308,7 +311,7 @@ mod tests {
         let crypto = crypto_box::SalsaBox::new(&crypto_peer, &crypto_secret);
 
         let shared = alice_static.diffie_hellman(&bob_public);
-        let ours = BoxKey::from_shared_secret(shared.as_bytes());
+        let ours = BoxKey::from_shared_secret(shared.as_bytes()).unwrap();
         let nonce = [0x31u8; 24];
 
         for len in sizes() {
@@ -338,15 +341,29 @@ mod tests {
         let bob_secret = StaticSecret::from([0xB2u8; 32]);
         let bob_public = PublicKey::from(&bob_secret);
         let alice_box =
-            BoxKey::from_shared_secret(alice_secret.diffie_hellman(&bob_public).as_bytes());
+            BoxKey::from_shared_secret(alice_secret.diffie_hellman(&bob_public).as_bytes())
+                .unwrap();
         let bob_box =
-            BoxKey::from_shared_secret(bob_secret.diffie_hellman(&alice_public).as_bytes());
+            BoxKey::from_shared_secret(bob_secret.diffie_hellman(&alice_public).as_bytes())
+                .unwrap();
         let nonce = [0x55u8; 24];
         let mut msg = bytes(1024);
 
         let tag = alice_box.encrypt_detached(&nonce, &mut msg);
         bob_box.decrypt_detached(&nonce, &mut msg, &tag).unwrap();
         assert_eq!(msg, bytes(1024));
+    }
+
+    #[test]
+    fn boxkey_rejects_zero_shared_secret() {
+        let low_order = PublicKey::from([0u8; 32]);
+        let shared = StaticSecret::from([0x11u8; 32]).diffie_hellman(&low_order);
+        assert_eq!(shared.as_bytes(), &[0u8; 32]);
+        assert!(BoxKey::from_shared_secret(shared.as_bytes()).is_none());
+
+        let mut almost_zero = [0u8; 32];
+        almost_zero[31] = 0x80;
+        assert!(BoxKey::from_shared_secret(&almost_zero).is_some());
     }
 
     #[test]
