@@ -153,3 +153,15 @@ jobs:
       - run: >-
           cargo miri test --target s390x-unknown-linux-gnu --lib --
           nacl_ boxkey_rejects boxkey_shared counter_carries
+
+  # The one check branch protection requires.
+  ci-success:
+    name: CI success
+    needs: [lint, test, avx512, perf, msrv, no-std, big-endian]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check that every job passed
+        env:
+          RESULTS: ${{ toJSON(needs.*.result) }}
+        run: jq -e 'all(. == "success")' <<< "$RESULTS"

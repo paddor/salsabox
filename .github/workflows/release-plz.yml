@@ -4,13 +4,23 @@ on:
   push:
     branches:
       - main
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
 
 permissions: {}
 
 jobs:
-  # Publish unpublished versions to crates.io via trusted publishing.
+  # Publish unpublished versions to crates.io via trusted publishing, once
+  # CI has passed on a push to main.
   release-plz-release:
-    if: github.repository_owner == 'paddor'
+    if: >-
+      github.repository_owner == 'paddor' &&
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -19,12 +29,27 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: main
           fetch-depth: 0
           persist-credentials: false
+      # Release only the commit CI passed. If main has moved on, the CI run
+      # of the newer commit triggers its own release.
+      - name: Check that main is the tested commit
+        id: tested
+        env:
+          TESTED_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          if [ "$(git rev-parse HEAD)" = "$TESTED_SHA" ]; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "main is past $TESTED_SHA, skipping"
+          fi
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        if: steps.tested.outputs.ok == 'true'
         with:
           toolchain: stable
       - uses: release-plz/action@8b5bf233ecb5779f63508db7cd050e948ee77cc2 # v0.5.144
+        if: steps.tested.outputs.ok == 'true'
         with:
           command: release
         env:
@@ -32,7 +57,7 @@ jobs:
 
   # Open or update the release PR.
   release-plz-pr:
-    if: github.repository_owner == 'paddor'
+    if: github.repository_owner == 'paddor' && github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: write
