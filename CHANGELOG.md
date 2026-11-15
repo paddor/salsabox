@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Sealing and opening no longer leave the XSalsa20 subkey, the Poly1305 key,
+  or block-0 keystream on the stack. The keystream is built in place instead
+  of moved by value.
+
 ## [0.1.0] - 2026-10-22
 
 ### Added

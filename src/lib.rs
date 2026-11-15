@@ -32,7 +32,8 @@
 //! Poly1305 is `RustCrypto` `poly1305`, and tags are compared with `subtle`.
 //! Keys, subkeys, and keystream buffers are wiped on drop. Poly1305's
 //! internal state is not, nor are copies the compiler keeps in registers or
-//! on the stack.
+//! on the stack. Moving a [`SecretBox`] or [`BoxKey`] by value can leave
+//! such copies, so keep long-lived keys in one place.
 
 #![no_std]
 
@@ -69,14 +70,16 @@ pub struct SecretBox {
 }
 
 impl SecretBox {
-    /// Create a secret box from an owned key.
+    /// Create a secret box from an owned key. Copies of `key` the caller
+    /// made before moving it in are not wiped.
     pub fn new(key: [u8; 32]) -> Self {
         Self {
             key: Zeroizing::new(key),
         }
     }
 
-    /// Create a secret box by copying a key.
+    /// Create a secret box by copying a key. The caller's key is not
+    /// wiped.
     pub fn from_key(key: &[u8; 32]) -> Self {
         Self::new(*key)
     }
@@ -84,10 +87,10 @@ impl SecretBox {
     /// Encrypt `buf` in place and return the detached Poly1305 tag.
     #[must_use = "the tag is needed to open the box"]
     pub fn encrypt_detached(&self, nonce: &[u8; 24], buf: &mut [u8]) -> [u8; 16] {
-        let keystream = salsa20::Keystream::new(self.key(), nonce);
-        let poly_key = Zeroizing::new(*keystream.poly1305_key());
+        let mut keystream = salsa20::Keystream::zeroed();
+        keystream.init(self.key(), nonce);
         keystream.xor(buf);
-        poly1305_tag(&poly_key, buf)
+        poly1305_tag(keystream.poly1305_key(), buf)
     }
 
     /// Verify `tag`, then decrypt `buf` in place. On failure `buf` is left
@@ -98,7 +101,8 @@ impl SecretBox {
         buf: &mut [u8],
         tag: &[u8; 16],
     ) -> Result<(), Error> {
-        let keystream = salsa20::Keystream::new(self.key(), nonce);
+        let mut keystream = salsa20::Keystream::zeroed();
+        keystream.init(self.key(), nonce);
         let mut expected = poly1305_tag(keystream.poly1305_key(), buf);
         let valid = expected.ct_eq(tag).unwrap_u8();
         expected.zeroize();
@@ -169,6 +173,9 @@ impl fmt::Debug for BoxKey {
 }
 
 /// `HSalsa20` key derivation used by `XSalsa20` and `NaCl` boxes.
+///
+/// The returned array is not wiped on drop. Wrap it in
+/// [`zeroize::Zeroizing`] when it is a key.
 pub fn hsalsa20(key: &[u8; 32], input: &[u8; 16]) -> [u8; 32] {
     salsa20::hsalsa20(key, input)
 }

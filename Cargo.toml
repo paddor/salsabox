@@ -18,6 +18,7 @@ std = ["fearless_simd/std"]
 
 [dependencies]
 fearless_simd = { version = "1.1", default-features = false, features = ["libm"] }
+# No `zeroize`: wiping its 576-byte state adds about 180 ns to every box.
 poly1305 = { version = "0.9.1", default-features = false }
 subtle = { version = "2.6", default-features = false }
 zeroize = { version = "1.8", default-features = false }

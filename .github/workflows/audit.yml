@@ -1,0 +1,34 @@
+name: Audit
+
+# RustSec check of a fresh dependency resolve, which is what users get.
+# The lockfile is not committed, so the weekly run also catches advisories
+# for new releases of dependencies.
+on:
+  push:
+    branches: [main]
+    paths: ["Cargo.toml", ".github/workflows/audit.yml"]
+  pull_request:
+    paths: ["Cargo.toml", ".github/workflows/audit.yml"]
+  schedule:
+    - cron: "23 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  cargo-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - run: cargo install cargo-audit --locked
+      - run: cargo generate-lockfile
+      - run: cargo audit
