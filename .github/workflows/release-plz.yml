@@ -1,80 +1,89 @@
 name: Release-plz
 
 on:
-  push:
-    branches:
-      - main
   workflow_run:
     workflows: [CI]
     types: [completed]
     branches: [main]
+  workflow_dispatch:
 
 permissions: {}
 
 jobs:
-  # Publish unpublished versions to crates.io via trusted publishing, once
-  # CI has passed on a push to main.
-  release-plz-release:
+  # Once CI has passed on a push to main, hand off to a dispatched run on
+  # main. Runs started with GITHUB_TOKEN do not trigger other workflows,
+  # except dispatches.
+  dispatch:
     if: >-
-      github.repository_owner == 'paddor' &&
+      github.repository == 'paddor/salsabox' &&
       github.event_name == 'workflow_run' &&
       github.event.workflow_run.event == 'push' &&
-      github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.head_repository.full_name == github.repository
+      github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     permissions:
+      actions: write
+    steps:
+      - name: Dispatch the release run
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run release-plz.yml --repo "$GITHUB_REPOSITORY" --ref main
+
+  # Publish unreleased versions to crates.io via trusted publishing, then
+  # open or update the release PR. Only for a main that passed CI.
+  release-plz:
+    if: >-
+      github.repository == 'paddor/salsabox' &&
+      github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: release-plz
+      cancel-in-progress: false
+    permissions:
       contents: write
+      pull-requests: write
+      actions: write
       id-token: write
-      pull-requests: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: main
           fetch-depth: 0
           persist-credentials: false
-      # Release only the commit CI passed. If main has moved on, the CI run
-      # of the newer commit triggers its own release.
-      - name: Check that main is the tested commit
-        id: tested
+      - name: Check that main passed CI
+        id: revision
         env:
-          TESTED_SHA: ${{ github.event.workflow_run.head_sha }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TESTED_SHA: ${{ github.sha }}
         run: |
-          if [ "$(git rev-parse HEAD)" = "$TESTED_SHA" ]; then
-            echo "ok=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "main is past $TESTED_SHA, skipping"
+          latest=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)
+          if test "$(git rev-parse HEAD)" = "$TESTED_SHA" && test "$TESTED_SHA" = "$latest"; then
+            gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$TESTED_SHA&event=push&status=success" \
+              --jq 'if (.workflow_runs | length) > 0 then "tested=true" else "tested=false" end' >> "$GITHUB_OUTPUT"
           fi
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
-        if: steps.tested.outputs.ok == 'true'
+        if: steps.revision.outputs.tested == 'true'
         with:
           toolchain: stable
-      - uses: release-plz/action@8b5bf233ecb5779f63508db7cd050e948ee77cc2 # v0.5.144
-        if: steps.tested.outputs.ok == 'true'
+      - name: Publish merged release
+        if: steps.revision.outputs.tested == 'true'
+        uses: release-plz/action@8b5bf233ecb5779f63508db7cd050e948ee77cc2 # v0.5.144
         with:
           command: release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  # Open or update the release PR.
-  release-plz-pr:
-    if: github.repository_owner == 'paddor' && github.event_name == 'push'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      pull-requests: write
-    concurrency:
-      group: release-plz-${{ github.ref }}
-      cancel-in-progress: false
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
-        with:
-          toolchain: stable
-      - uses: release-plz/action@8b5bf233ecb5779f63508db7cd050e948ee77cc2 # v0.5.144
+      - name: Prepare release PR
+        if: steps.revision.outputs.tested == 'true'
+        id: release-pr
+        uses: release-plz/action@8b5bf233ecb5779f63508db7cd050e948ee77cc2 # v0.5.144
         with:
           command: release-pr
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # The release PR comes from GITHUB_TOKEN, so CI does not run on it by
+      # itself. Branch protection needs its checks.
+      - name: Run CI on the release PR
+        if: steps.release-pr.outputs.prs_created == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_BRANCH: ${{ fromJSON(steps.release-pr.outputs.pr || '{}').head_branch }}
+        run: gh workflow run ci.yml --repo "$GITHUB_REPOSITORY" --ref "$RELEASE_BRANCH"
