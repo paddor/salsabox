@@ -39,19 +39,29 @@ fn level() -> Level {
 /// `XSalsa20` keystream of one key and nonce. Block 0 supplies the
 /// Poly1305 key and the keystream of the first 32 data bytes; later data
 /// uses blocks 1 and up.
+///
+/// Built in place by `init`: a by-value move would leave copies of the
+/// subkey and block 0 that `Drop` never wipes.
 pub(crate) struct Keystream {
     state: [u32; STATE_WORDS],
     first_block: [u8; BLOCK_LEN],
 }
 
 impl Keystream {
-    pub(crate) fn new(key: &[u8; 32], nonce: &[u8; 24]) -> Self {
-        let mut subkey = hsalsa20(key, nonce[..16].try_into().unwrap());
-        let mut state = salsa20_state(&subkey, nonce[16..].try_into().unwrap(), 0);
+    pub(crate) const fn zeroed() -> Self {
+        Self {
+            state: [0; STATE_WORDS],
+            first_block: [0; BLOCK_LEN],
+        }
+    }
+
+    pub(crate) fn init(&mut self, key: &[u8; 32], nonce: &[u8; 24]) {
+        let mut subkey = [0u8; 32];
+        hsalsa20_into(key, nonce[..16].try_into().unwrap(), &mut subkey);
+        salsa20_state_into(&mut self.state, &subkey, nonce[16..].try_into().unwrap());
         subkey.zeroize();
-        let first_block = salsa20_block(&state);
-        set_counter(&mut state, 1);
-        Self { state, first_block }
+        salsa20_block_into(&self.state, &mut self.first_block);
+        set_counter(&mut self.state, 1);
     }
 
     pub(crate) fn poly1305_key(&self) -> &[u8; 32] {
@@ -61,11 +71,11 @@ impl Keystream {
     }
 
     /// XOR the keystream into `data`, starting at data byte 0.
-    pub(crate) fn xor(self, data: &mut [u8]) {
+    pub(crate) fn xor(&mut self, data: &mut [u8]) {
         self.xor_at_level(data, level());
     }
 
-    fn xor_at_level(self, data: &mut [u8], level: Level) {
+    fn xor_at_level(&mut self, data: &mut [u8], level: Level) {
         let first_len = data.len().min(BLOCK_LEN - FIRST_BLOCK_DATA_OFFSET);
         let (head, rest) = data.split_at_mut(first_len);
         xor_bytes(head, &self.first_block[FIRST_BLOCK_DATA_OFFSET..]);
@@ -86,6 +96,12 @@ impl Drop for Keystream {
 }
 
 pub(crate) fn hsalsa20(key: &[u8; 32], input: &[u8; 16]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    hsalsa20_into(key, input, &mut out);
+    out
+}
+
+fn hsalsa20_into(key: &[u8; 32], input: &[u8; 16], out: &mut [u8; 32]) {
     let mut state = [0u32; STATE_WORDS];
     state[0] = CONSTANTS[0];
     read_words(&key[..16], &mut state[1..5]);
@@ -100,38 +116,33 @@ pub(crate) fn hsalsa20(key: &[u8; 32], input: &[u8; 16]) -> [u8; 32] {
     }
 
     let key_idx = [0, 5, 10, 15, 6, 7, 8, 9];
-    let mut out = [0u8; 32];
     for (chunk, idx) in out.as_chunks_mut::<4>().0.iter_mut().zip(key_idx) {
         chunk.copy_from_slice(&state[idx].to_le_bytes());
     }
     state.zeroize();
-    out
 }
 
-fn salsa20_state(key: &[u8; 32], nonce: [u8; 8], counter: u64) -> [u32; STATE_WORDS] {
-    let mut state = [0u32; STATE_WORDS];
+/// Salsa20 state of `key` and `nonce` at block 0.
+fn salsa20_state_into(state: &mut [u32; STATE_WORDS], key: &[u8; 32], nonce: [u8; 8]) {
     state[0] = CONSTANTS[0];
     read_words(&key[..16], &mut state[1..5]);
     state[5] = CONSTANTS[1];
     read_words(&nonce, &mut state[6..8]);
-    set_counter(&mut state, counter);
+    set_counter(state, 0);
     state[10] = CONSTANTS[2];
     read_words(&key[16..], &mut state[11..15]);
     state[15] = CONSTANTS[3];
-    state
 }
 
-fn salsa20_block(state: &[u32; STATE_WORDS]) -> [u8; BLOCK_LEN] {
+fn salsa20_block_into(state: &[u32; STATE_WORDS], out: &mut [u8; BLOCK_LEN]) {
     let mut words = *state;
     for _ in 0..10 {
         double_round(&mut words);
     }
-    let mut out = [0u8; BLOCK_LEN];
     for ((chunk, word), initial) in out.as_chunks_mut::<4>().0.iter_mut().zip(words).zip(state) {
         chunk.copy_from_slice(&word.wrapping_add(*initial).to_le_bytes());
     }
     words.zeroize();
-    out
 }
 
 /// XOR the keystream of `state` and the following blocks into `data`.
@@ -200,7 +211,8 @@ where
 
 /// XOR one scalar keystream block of `state` into at most 64 bytes.
 fn xor_block(state: &[u32; STATE_WORDS], data: &mut [u8]) {
-    let mut block = salsa20_block(state);
+    let mut block = [0u8; BLOCK_LEN];
+    salsa20_block_into(state, &mut block);
     xor_bytes(data, &block);
     block.zeroize();
 }
@@ -352,9 +364,21 @@ mod tests {
     /// `NaCl` `firstkey` and nonce.
     const SODIUM_STREAM_EXP: &str = include_str!("../testdata/libsodium-stream.exp");
 
+    fn new_keystream(key: &[u8; 32], nonce: &[u8; 24]) -> Keystream {
+        let mut keystream = Keystream::zeroed();
+        keystream.init(key, nonce);
+        keystream
+    }
+
+    fn salsa20_block(state: &[u32; STATE_WORDS]) -> [u8; BLOCK_LEN] {
+        let mut out = [0u8; BLOCK_LEN];
+        salsa20_block_into(state, &mut out);
+        out
+    }
+
     /// XOR with one scalar block per 64 bytes, the reference for SIMD paths.
     fn xor_scalar(key: &[u8; 32], nonce: &[u8; 24], data: &mut [u8]) -> [u8; 32] {
-        let keystream = Keystream::new(key, nonce);
+        let keystream = new_keystream(key, nonce);
         let poly_key = *keystream.poly1305_key();
         let first_len = data.len().min(BLOCK_LEN - FIRST_BLOCK_DATA_OFFSET);
         let (head, rest) = data.split_at_mut(first_len);
@@ -409,7 +433,7 @@ mod tests {
     /// Raw `XSalsa20` keystream under the `NaCl` key: block 0, then blocks 1
     /// and up.
     fn raw_keystream(level: Level, len: usize) -> Vec<u8> {
-        let keystream = Keystream::new(&FIRSTKEY, &NONCE);
+        let mut keystream = new_keystream(&FIRSTKEY, &NONCE);
         let mut out = vec![0u8; len];
         let head = len.min(FIRST_BLOCK_DATA_OFFSET);
         out[..head].copy_from_slice(&keystream.poly1305_key()[..head]);
@@ -420,7 +444,7 @@ mod tests {
     /// Keystream under the `NaCl` key from block `counter` on, through the
     /// batch path.
     fn keystream_from(level: Level, counter: u64, len: usize) -> Vec<u8> {
-        let mut state = Keystream::new(&FIRSTKEY, &NONCE).state;
+        let mut state = new_keystream(&FIRSTKEY, &NONCE).state;
         set_counter(&mut state, counter);
         let mut out = vec![0u8; len];
         dispatch!(level, simd => xor_stream(simd, &state, &mut out));
@@ -439,7 +463,7 @@ mod tests {
                 let mut expected = plaintext.clone();
                 let expected_poly = xor_scalar(&key, &nonce, &mut expected);
 
-                let keystream = Keystream::new(&key, &nonce);
+                let mut keystream = new_keystream(&key, &nonce);
                 assert_eq!(*keystream.poly1305_key(), expected_poly, "{name} poly key");
                 let mut actual = plaintext;
                 keystream.xor_at_level(&mut actual, level);
@@ -453,7 +477,7 @@ mod tests {
         let key = [0x5Au8; 32];
         let nonce = [0xA5u8; 24];
         for (name, level) in levels() {
-            let mut keystream = Keystream::new(&key, &nonce);
+            let mut keystream = new_keystream(&key, &nonce);
             set_counter(&mut keystream.state, u64::from(u32::MAX) - 5);
             let start = keystream.state;
             let mut actual = vec![0u8; 32 + 40 * BLOCK_LEN];
@@ -483,7 +507,7 @@ mod tests {
 
             for (name, level) in &levels {
                 let mut actual = plaintext.clone();
-                Keystream::new(&key, &nonce).xor_at_level(&mut actual, *level);
+                new_keystream(&key, &nonce).xor_at_level(&mut actual, *level);
                 assert_eq!(actual, expected, "{name} len {}", plaintext.len());
             }
         }

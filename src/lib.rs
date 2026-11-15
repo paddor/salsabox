@@ -84,10 +84,10 @@ impl SecretBox {
     /// Encrypt `buf` in place and return the detached Poly1305 tag.
     #[must_use = "the tag is needed to open the box"]
     pub fn encrypt_detached(&self, nonce: &[u8; 24], buf: &mut [u8]) -> [u8; 16] {
-        let keystream = salsa20::Keystream::new(self.key(), nonce);
-        let poly_key = Zeroizing::new(*keystream.poly1305_key());
+        let mut keystream = salsa20::Keystream::zeroed();
+        keystream.init(self.key(), nonce);
         keystream.xor(buf);
-        poly1305_tag(&poly_key, buf)
+        poly1305_tag(keystream.poly1305_key(), buf)
     }
 
     /// Verify `tag`, then decrypt `buf` in place. On failure `buf` is left
@@ -98,7 +98,8 @@ impl SecretBox {
         buf: &mut [u8],
         tag: &[u8; 16],
     ) -> Result<(), Error> {
-        let keystream = salsa20::Keystream::new(self.key(), nonce);
+        let mut keystream = salsa20::Keystream::zeroed();
+        keystream.init(self.key(), nonce);
         let mut expected = poly1305_tag(keystream.poly1305_key(), buf);
         let valid = expected.ct_eq(tag).unwrap_u8();
         expected.zeroize();
